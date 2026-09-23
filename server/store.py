@@ -210,7 +210,7 @@ def _text_from_txt(path):
         raw = f.read()
     text = raw.decode("utf-8", errors="replace")
     # 粗探: 替换符密度高说明不是 UTF-8, 试 GBK
-    if "\ufffd" in text * 10:
+    if "\ufffd" in text:
         try:
             text = raw.decode("gbk", errors="replace")
         except Exception:
