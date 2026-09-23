@@ -1,5 +1,6 @@
 // ai.js — AI 助手：悬浮按钮 + 对话面板 + 流式响应 + 设置 + Agent 上下文
 import API from './api.js';
+import { extractPdfText } from './pdftext.js';
 
 let history = [];        // 对话历史 [{role, content}]
 let sending = false;     // 是否正在发送/接收
@@ -470,7 +471,7 @@ async function send() {
           scrollToBottom();
         }
         if (data.actions) {
-          executeActions(data.actions);
+          executeActions(data.actions, statusEl);
         }
         if (data.done) {
           removeTyping();
@@ -505,11 +506,28 @@ async function send() {
 }
 
 /** 执行 AI 返回的动作 */
-function executeActions(actions) {
+function executeActions(actions, statusEl) {
   if (!Array.isArray(actions)) return;
+  // 状态气泡是临时的 (回复结束时会被移除), 异步回写前先确认它还挂在树上
+  const say = (msg) => {
+    if (statusEl && statusEl.isConnected) statusEl.textContent = msg;
+  };
   for (const a of actions) {
     if (a.type === 'open_book' && a.book_id) {
       location.hash = `#/book/${encodeURIComponent(a.book_id)}`;
+    } else if (a.type === 'extract_text' && a.book_id) {
+      // 后端读不出这本 PDF 的文字(PyMuPDF 没装), 需要我们这边用 pdf.js 抽一次
+      // 回传。刻意不 await: SSE 流还在继续, 抽完自然会落缓存, 之后的工具调用
+      // 就能读到。本次对话里 AI 多半还是会说"还没提取完", 这是实话。
+      say('正在提取 PDF 文字…');
+      extractPdfText(a.book_id, {
+        onProgress: (done, total) => say(`正在提取 PDF 文字… ${done}/${total} 页`),
+      })
+        .then((r) => {
+          if (r.skipped) say('后端会直接读取这本书的文字, 可以再问一次了');
+          else say(`文字提取完成 (${r.chars} 字 / ${r.pageCount} 页), 现在可以再问一次`);
+        })
+        .catch((e) => say(`文字提取失败: ${e.message}`));
     }
   }
 }

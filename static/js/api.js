@@ -200,10 +200,15 @@ const API = {
 
   async saveAIConfig(cfg) {
     try {
+      // 只在真的填了 key 时才带上这个字段。带空串会让后端把已存的 key 覆盖成空,
+      // 而设置面板承诺的是"留空则不修改"。
+      const body = { endpoint: cfg.endpoint, model: cfg.model };
+      if (cfg.api_key) body.api_key = cfg.api_key;
+      if (cfg.clear_key) body.clear_key = true;
       const r = await fetch('/api/ai/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: cfg.api_key, endpoint: cfg.endpoint, model: cfg.model }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error('保存AI配置失败');
       return await r.json();
@@ -222,6 +227,83 @@ const API = {
       throw new Error(err.error || 'AI请求失败');
     }
     return r;
+  },
+
+  // ---- 书库 (外部电子书仓库) ----
+  async getLibrarySource() {
+    try {
+      const r = await fetch('/api/library/source');
+      if (!r.ok) return { path: '', valid: false, reason: '' };
+      return await r.json();
+    } catch { return { path: '', valid: false, reason: '' }; }
+  },
+
+  async setLibrarySource(path) {
+    const r = await fetch('/api/library/source', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || '保存书库路径失败');
+    return d;
+  },
+
+  async scanLibrary() {
+    try {
+      const r = await fetch('/api/library/scan');
+      if (!r.ok) return { valid: false, items: [], reason: '扫描失败' };
+      return await r.json();
+    } catch { return { valid: false, items: [], reason: '扫描失败' }; }
+  },
+
+  async importFromLibrary(file) {
+    const r = await fetch('/api/library/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || '导入失败');
+    return d;
+  },
+
+  // ---- 书籍文字缓存 (PDF 需要前端用 pdf.js 抽一次) ----
+  // 后端能力探测。拿不到时保守地当作"后端能抽", 免得前端抢着写出残缺正文。
+  async getCapabilities() {
+    try {
+      const r = await fetch('/api/capabilities');
+      if (!r.ok) return { pdf_backend: '', client_extract_needed: false };
+      return await r.json();
+    } catch { return { pdf_backend: '', client_extract_needed: false }; }
+  },
+
+  async getBookTextStatus(bookId) {
+    try {
+      const r = await fetch(`/api/books/${encodeURIComponent(bookId)}/text`);
+      if (!r.ok) return { cached: false };
+      return await r.json();
+    } catch { return { cached: false }; }
+  },
+
+  async saveBookText(bookId, text, extra = {}) {
+    const r = await fetch(`/api/books/${encodeURIComponent(bookId)}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, ...extra }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || '保存正文失败');
+    }
+    return await r.json();
+  },
+
+  async deleteBookText(bookId) {
+    try {
+      const r = await fetch(`/api/books/${encodeURIComponent(bookId)}/text`, { method: 'DELETE' });
+      return await r.json();
+    } catch { return { ok: false }; }
   },
 };
 

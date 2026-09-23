@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler
 from .constants import *
 from .store import *
 from .ai import *
+from . import textcache
+from . import library
 
 # --------------------------------------------------------------------------- #
 #  HTTP 处理器
@@ -86,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_notes(book_id)
             if action == "category":
                 return self._api_set_category(book_id)
+            if action == "text":
+                # 前端用 pdf.js 抽完文字后回传, 服务端落缓存
+                return self._api_save_book_text(book_id)
 
         # /api/categories
         if parts == ["api", "categories"]:
@@ -115,6 +120,14 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "books", "reorder"]:
             return self._api_reorder_books()
 
+        # /api/library/source  -> 设置书库路径
+        if parts == ["api", "library", "source"]:
+            return self._api_library_source_set()
+
+        # /api/library/import  -> 从书库导入一本书
+        if parts == ["api", "library", "import"]:
+            return self._api_library_import()
+
         if len(parts) == 2 and parts[0] == "api" and parts[1] == "library":
             return self._api_save_library()
 
@@ -139,6 +152,10 @@ class Handler(BaseHTTPRequestHandler):
         # /api/ai/memory/<id>
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "ai" and parts[2] == "memory":
             return self._api_memory_delete(urllib.parse.unquote(parts[3]))
+
+        # /api/books/<id>/text  -> 作废该书的文字缓存 (用于"重新提取")
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "books" and parts[3] == "text":
+            return self._api_delete_book_text(parts[2])
 
         self._json(404, {"error": "unknown endpoint"})
 
@@ -195,22 +212,41 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- API GET ----
     def _api_get(self, parts, parsed):
+        # /api/capabilities -> 后端能力探测。前端据此决定要不要用 pdf.js 抽文字:
+        # 后端能抽(PyMuPDF 已装)就绝不能让前端抽 —— pdf.js 抽中文会丢汉字。
+        if parts == ["api", "capabilities"]:
+            backend = pdf_extract_backend()
+            return self._json(200, {
+                "pdf_backend": backend,
+                "client_extract_needed": not backend,
+            })
+
+        # /api/library/source -> 当前书库路径及其可用性
+        if parts == ["api", "library", "source"]:
+            return self._api_library_source_get()
+
+        # /api/library/scan -> 扫描书库, 列出可导入的书
+        if parts == ["api", "library", "scan"]:
+            return self._api_library_scan()
+
         # /api/books
         if parts == ["api", "books"]:
             lib = load_library()
             trash = lib.get("trash", {})
             books = scan_books()
-            meta_lib = lib.get("books", {})
             # 过滤掉回收站中的书籍 (文件仍在磁盘, 但不应出现在书架)
             books = [b for b in books if b["id"] not in trash]
             for b in books:
-                meta = meta_lib.get(b["id"], {})
+                meta = get_book_meta(lib, b["id"])
                 b["title"] = meta.get("title") or os.path.splitext(b["name"])[0]
                 b["author"] = meta.get("author", "")
                 b["progress"] = meta.get("progress", 0)
                 b["lastRead"] = meta.get("lastRead", 0)
                 b["hasCover"] = bool(meta.get("cover"))
                 b["category"] = meta.get("category", "")
+                # bookshelf.js 的"自定义排序"靠 position 排序, 但这里从来没下发过它,
+                # 于是刷新后全是 undefined, 一并落到 99999, 排序退化成按 mtime。
+                b["position"] = meta.get("position")
             return self._json(200, {"books": books})
 
         # /api/library
@@ -263,6 +299,10 @@ class Handler(BaseHTTPRequestHandler):
             elif full.lower().endswith(".pdf"):
                 ctype = "application/pdf"
             return self._stream_file(full, ctype)
+
+        # /api/books/<id>/text  -> 文字缓存状态 (前端据此决定要不要启动 pdf.js 抽取)
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "books" and parts[3] == "text":
+            return self._api_book_text_status(parts[2])
 
         # /api/books/<id>/progress
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "books" and parts[3] == "progress":
@@ -494,13 +534,113 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "saved": saved})
 
     # ---- AI 配置 ----
+    # ---- 书库 (外部电子书仓库) ----
+    def _api_library_source_get(self):
+        path = library.active_source_path()
+        ok, why = library.validate_source(path)
+        return self._json(200, {"path": path, "valid": ok, "reason": why})
+
+    def _api_library_source_set(self):
+        try:
+            payload = json.loads(self._read_body().decode("utf-8"))
+        except Exception:
+            return self._json(400, {"error": "bad json"})
+        path = (payload.get("path") or "").strip()
+        ok, why = library.validate_source(path)
+        if not ok:
+            return self._json(400, {"error": why})
+        library.save_sources_config({"path": path, "updatedAt": int(time.time())})
+        self._json(200, {"ok": True, "path": path})
+
+    def _api_library_scan(self):
+        path = library.active_source_path()
+        ok, why = library.validate_source(path)
+        if not ok:
+            return self._json(200, {"path": path, "valid": False,
+                                    "reason": why, "items": []})
+        self._json(200, {"path": path, "valid": True, "items": library.scan_source(path)})
+
+    def _api_library_import(self):
+        try:
+            payload = json.loads(self._read_body().decode("utf-8"))
+        except Exception:
+            return self._json(400, {"error": "bad json"})
+        info, err = library.import_book(library.active_source_path(),
+                                        payload.get("file") or "")
+        if err:
+            return self._json(400, {"error": err})
+        self._json(200, dict({"ok": True}, **info))
+
+    # ---- 书籍文字缓存 (PDF 得靠前端 pdf.js 抽一次) ----
+    # 回传正文的大小上限。_read_body() 是按 Content-Length 一次性全读进内存的,
+    # 不设上限就等于把本地服务变成内存放大器。
+    MAX_TEXT_BODY = 32 * 1024 * 1024
+
+    def _api_book_text_status(self, book_id):
+        """前端据此决定要不要启动抽取。"""
+        bid = urllib.parse.unquote(book_id)
+        full = book_path(bid)
+        if not full:
+            return self._json(404, {"error": "book not found"})
+        text, meta = textcache.read_cached_text(bid, full)
+        if text is None:
+            return self._json(200, {"cached": False})
+        return self._json(200, {
+            "cached": True,
+            "chars": meta.get("chars"),
+            "source": meta.get("source"),
+            "pageCount": meta.get("pageCount"),
+        })
+
+    def _api_save_book_text(self, book_id):
+        """接收前端 pdf.js 抽好的正文并落缓存。"""
+        bid = urllib.parse.unquote(book_id)
+        full = book_path(bid)
+        if not full:
+            return self._json(404, {"error": "book not found"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length > self.MAX_TEXT_BODY:
+            return self._json(413, {"error": "正文过大 (上限 {} MB)".format(
+                self.MAX_TEXT_BODY // (1024 * 1024))})
+        try:
+            payload = json.loads(self._read_body().decode("utf-8"))
+        except Exception:
+            return self._json(400, {"error": "bad json"})
+        text = payload.get("text") or ""
+        if not text.strip():
+            return self._json(400, {"error": "text 为空"})
+        extra = {}
+        if payload.get("pageCount"):
+            extra["pageCount"] = payload["pageCount"]
+        if payload.get("pageOffsets"):
+            extra["pageOffsets"] = payload["pageOffsets"]
+        meta = textcache.write_cached_text(bid, full, text, "client", extra)
+        if meta is None:
+            return self._json(500, {"error": "写入缓存失败"})
+        return self._json(200, {"ok": True, "chars": meta["chars"], "source": meta["source"]})
+
+    def _api_delete_book_text(self, book_id):
+        """作废缓存, 供"重新提取"用。"""
+        bid = urllib.parse.unquote(book_id)
+        removed = textcache.invalidate_cache(bid)
+        self._json(200, {"ok": True, "removed": removed})
+
     def _api_save_ai_config(self):
         try:
             payload = json.loads(self._read_body().decode("utf-8"))
         except Exception:
             return self._json(400, {"error": "bad json"})
         cfg = load_ai_config()
-        if "api_key" in payload:
+        # 只在真的传了非空 key 时才覆盖。原来这里用 `if "api_key" in payload`,
+        # 而前端每次都带这个字段(哪怕是空串) —— 于是用户第二次点保存就把已存的
+        # key 抹成空串, 是静默的数据丢失, 且 UI 上明明承诺的是"留空则不修改"。
+        # 要显式清空请传 clear_key: true。
+        if payload.get("clear_key"):
+            cfg["api_key"] = ""
+        elif payload.get("api_key"):
             cfg["api_key"] = payload["api_key"]
         if "endpoint" in payload:
             cfg["endpoint"] = payload["endpoint"]
@@ -564,7 +704,7 @@ class Handler(BaseHTTPRequestHandler):
         ctx_builder = ContextBuilder(MEMORY, config)
         registry = ToolRegistry()
         register_default_tools(registry)
-        controller = AgentLoopController()
+        controller = AgentLoopController(config)
 
         llm_messages = ctx_builder.build(messages, context, session_id)
         collected_actions = []
@@ -684,8 +824,8 @@ class Handler(BaseHTTPRequestHandler):
             if act not in collected_actions:
                 collected_actions.append(act)
 
-        # 清除最终回答中的动作指令行
-        clean_content = re.sub(r'__ACTION__:open_book:[^\s"\'\\]+', '', final_content).strip()
+        # 清除最终回答中的动作指令行 (用与 extract_actions 同一个模式, 免得漏掉新动作)
+        clean_content = re.sub(ACTION_PATTERN, '', final_content).strip()
 
         if not clean_content and not collected_actions:
             clean_content = "(AI 未返回内容, 请检查 AI 配置或稍后重试。)"

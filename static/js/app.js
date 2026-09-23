@@ -4,6 +4,7 @@ import { Reader } from './reader.js';
 import Notes from './notes.js';
 import AI from './ai.js';
 import API from './api.js';
+import { openLibraryPanel, bindLibraryPanel } from './library.js';
 
 // 配置 PDF.js worker（本地化）
 if (window.pdfjsLib) {
@@ -259,6 +260,11 @@ function bind() {
 
   // 笔记中心
   initNotesCenter();
+
+  // 书库面板
+  bindLibraryPanel();
+  const btnLibrary = document.getElementById('btn-library');
+  if (btnLibrary) btnLibrary.addEventListener('click', openLibraryPanel);
 
   // 文件上传
   const fileInput = document.getElementById('file-input');

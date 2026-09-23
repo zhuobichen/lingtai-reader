@@ -15,8 +15,13 @@ __all__ = [
     "make_tool_result", "TokenEstimator", "ContextCompressor", "MemoryManager",
     "MEMORY", "ToolRegistry", "AgentLoopController", "ContextBuilder",
     "AI_SYSTEM_PROMPT", "TOOL_DEFS", "AI_TOOLS", "register_default_tools",
-    "extract_actions", "call_llm_api", "call_llm_stream",
+    "extract_actions", "call_llm_api", "call_llm_stream", "ACTION_PATTERN",
 ]
+
+# __ACTION__:<type>:<arg> —— 工具用它把"必须在浏览器里执行的动作"回传给前端。
+# 提成常量是因为两处必须完全一致: 这里抽取动作, routes.py 在最终回答里把它清掉。
+# 不一致的话, 动作指令会原样漏进聊天气泡给用户看到。
+ACTION_PATTERN = r'__ACTION__:([a-z_]+):([^\s"\'\\]+)'
 
 # ---- 联网搜索 + 下载书籍 ----
 def _tool_web_search(args, context):
@@ -136,8 +141,10 @@ def _tool_download_book(args, context):
                 return make_tool_result(False, error="下载内容过小, 可能是无效链接", retryable=False)
             with open(dest, "wb") as f:
                 f.write(data)
-            # 自动导入到书架
-            bid = urllib.parse.quote(fname)
+            # 自动导入到书架。
+            # key 必须是裸文件名 —— scan_books() 返回的 id 就是裸文件名, 两边不一致
+            # 会导致中文/空格书名的 meta 查不到, title 静默退化成文件名。
+            bid = fname
             lib = load_library()
             meta = lib.setdefault("books", {}).setdefault(bid, {})
             meta["title"] = title or os.path.splitext(fname)[0]
@@ -191,6 +198,15 @@ class TokenEstimator:
         return total
 
 
+def _cfg_int(config, key, default):
+    """从配置里取一个正整数; 缺失 / 非法 / 非正数都退回默认值。"""
+    try:
+        v = int((config or {}).get(key) or 0)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
 # ---- 0b. ContextCompressor ----
 class ContextCompressor:
     """上下文压缩: 当消息历史超 token 预算时, 调 LLM 生成结构化摘要替换旧消息
@@ -199,13 +215,20 @@ class ContextCompressor:
     即: 保留用户意图、已完成操作及关键结果、未完成任务、工具调用参数与返回数据。
     """
 
-    TOKEN_BUDGET = 12000       # 总 token 预算 (留给模型回复空间)
-    SUMMARY_THRESHOLD = 8000  # 超过此值触发压缩
-    KEEP_RECENT = 6            # 压缩时保留最近 N 条消息 (不截断)
-    TOOL_RESULT_KEEP = 800     # 工具返回结果在摘要请求中的保留长度 (字符)
+    # 这组值原本是 12000/8000/6/800 —— 那是按 8k~32k 上下文模型定的尺码。
+    # 默认模型现在是 1M 上下文的 deepseek-flash, 压到 12k 是纯粹的浪费,
+    # 而且压缩过程会顺手把书籍正文挤掉(见 _summarize_tool_result)。
+    # 保留这组类常量作为兜底, 实际取值可在设置里用 context_budget 覆盖。
+    TOKEN_BUDGET = 120000      # 总 token 预算 (留给模型回复空间)
+    SUMMARY_THRESHOLD = 96000  # 超过此值触发压缩
+    KEEP_RECENT = 8            # 压缩时保留最近 N 条消息 (不截断)
+    TOOL_RESULT_KEEP = 6000    # 工具返回结果在摘要请求中的保留长度 (字符)
 
     def __init__(self, config):
         self.config = config
+        # 实例属性遮蔽类属性, 只影响这一个实例
+        self.TOKEN_BUDGET = _cfg_int(config, "context_budget", self.TOKEN_BUDGET)
+        self.SUMMARY_THRESHOLD = int(self.TOKEN_BUDGET * 0.8)
 
     def should_compress(self, messages):
         """检查是否需要压缩"""
@@ -324,9 +347,22 @@ class ContextCompressor:
                     return "找到 {} 本书: {}".format(
                         data.get("count", len(books)),
                         "; ".join(items) + ("..." if len(books) > 20 else ""))
-                # 书籍内容: 保留前 500 字
+                # 书籍内容: 保留较大片段, 并告知总量与继续读取的方式。
+                # 原来是 data["content"][:500] —— 正文一变长, 模型就只看得到开头,
+                # 却以为自己读完了整本书, 表现为"总结得极浅"。而且这个截断是静默的,
+                # 只改 get_book_content 的 max_chars 而不同步改这里, 等于白改。
                 if "content" in data:
-                    return "书籍文本(前500字): {}".format(data["content"][:500])
+                    seg = data["content"]
+                    total = data.get("totalChars") or len(seg)
+                    head = seg[:3000]
+                    if data.get("hasMore"):
+                        note = "...[已截断, 全文共 {} 字, 可用 offset={} 继续读取]".format(
+                            total, data.get("nextOffset"))
+                    elif len(seg) > 3000:
+                        note = "...[已截断, 本段共 {} 字]".format(len(seg))
+                    else:
+                        note = ""
+                    return "书籍文本(共{}字): {}{}".format(total, head, note)
                 # 分类列表
                 if "categories" in data:
                     cats = data["categories"]
@@ -560,13 +596,20 @@ class ToolRegistry:
 class AgentLoopController:
     """Agent 循环控制: 步数 / 重复 / 失败 / 超时 限制 + 步骤日志"""
 
-    MAX_STEPS = 8            # 最大思考步数 (从 6 提升至 8)
+    MAX_STEPS = 12           # 最大思考步数 (长上下文下允许多读几轮)
     MAX_SAME_TOOL_CALLS = 2
     MAX_FAILURES = 2
-    TIMEOUT_PER_STEP = 30   # 单步超时 (秒)
-    MAX_TOTAL_TIME = 120    # Agent 总执行超时 (秒)
+    # 单步超时原本 30 秒 —— 是按 8k 上下文的调用耗时定的。往 1M 上下文里塞
+    # 一本书的正文, 单次 LLM 调用轻松超过 30 秒, 于是下一轮 should_stop()
+    # 会判"当前步骤执行超时"直接中断。不放宽的话, 长上下文必然随机超时,
+    # 问题会从"提不出文本"变成"莫名其妙地失败", 反而更难定位。
+    TIMEOUT_PER_STEP = 120  # 单步超时 (秒)
+    MAX_TOTAL_TIME = 600    # Agent 总执行超时 (秒)
 
-    def __init__(self):
+    def __init__(self, config=None):
+        config = config or {}
+        self.TIMEOUT_PER_STEP = _cfg_int(config, "step_timeout", self.TIMEOUT_PER_STEP)
+        self.MAX_TOTAL_TIME = _cfg_int(config, "total_timeout", self.MAX_TOTAL_TIME)
         self.step = 0
         self.failures = 0
         self.call_history = []  # [(name, args_key)]
@@ -699,27 +742,16 @@ AI_SYSTEM_PROMPT = """你是「阅微」, 一个本地电子书书架的智能 A
 - 这确保了你的操作不会影响用户的系统安全。
 
 ## 你的能力 (可用工具)
-1. list_books - 列出书架上的所有书籍 (含书名/作者/格式/分类/进度)
-2. find_books - 按关键词搜索书籍
-3. get_book_content - 获取一本书的文本内容, 用于总结或分析
-4. get_book_metadata - 获取书籍元数据 (标题/作者/分类/进度)
-5. categorize_book - 为单本书设置分类
-6. batch_categorize - 批量设置多本书的分类 (一次调用完成, 当需要分类多本书时务必用这个, 不要逐本调用)
-7. list_categories - 列出所有已创建的分类
-8. rename_category - 重命名分类 (该分类下所有书籍同步更新)
-9. delete_category - 删除分类 (书籍归入未分类)
-10. delete_book - 将一本书移入回收站 (不删文件, 30天可恢复)
-11. open_book - 在阅读器中打开一本书 (前端会执行打开操作)
-12. create_note - 为一本书创建笔记
-13. remember_preference - 将用户偏好或重要事实保存到长期记忆
-14. recall_memory - 从长期记忆中检索与查询相关的记忆
-15. get_reading_context - 获取用户当前正在阅读的书籍上下文
-16. web_search - 联网搜索互联网, 获取搜索结果(标题/URL/摘要). 用于查找书籍下载链接或获取最新信息
-17. download_book - 从 URL 下载书籍文件并自动导入书架. 支持 PDF/EPUB/TXT/MOBI/AZW3
+{TOOL_LIST}
 
 ## 行为规则
 - 用简洁友好的中文回答。
 - 当用户要求总结一本书时, 先调用 get_book_content 获取内容, 再进行总结。
+  长书是分段返回的: hasMore=true 说明还有没读到的部分, 用 nextOffset 接着读;
+  需要通读全书才能回答的问题(如"整体脉络"), 应当连续翻页直到 hasMore=false 再下结论,
+  不要只看了开头就当作读完了整本。若返回 status=need_client_extract, 说明这本 PDF
+  还没提取过文字, 用完全相同的参数再调一次(get_book_content 每次返回的内容都不同,
+  重调时参数必须一致)。
 - **当用户要求分类多本书时, 先调用 list_books 获取书单, 然后直接用 batch_categorize 一次性完成全部分类, 不要逐本调用 categorize_book。**
 - **当用户要求下载书籍时: 1) 先用 web_search 搜索 "书名 作者 pdf" (不要加引号, 不要加 filetype), 2) 检查返回的 file_links 字段是否有 PDF 直链, 3) 如果有就调用 download_book 下载, 4) 如果没有 file_links, 换个搜索词再搜一次 (如英文书名), 5) 最多搜索 3 次, 不要无限搜索.**
 - **重要: 搜索次数不要超过 3 次, 如果 3 次都没找到 PDF 直链, 就基于知识库推荐书籍并告知用户.**
@@ -741,13 +773,12 @@ def _tool_list_books(args, context):
     books = scan_books()
     lib = load_library()
     trash = lib.get("trash", {})
-    meta_lib = lib.get("books", {})
     data = []
     for b in books:
         # 排除回收站中的书籍
         if b["id"] in trash:
             continue
-        meta = meta_lib.get(b["id"], {})
+        meta = get_book_meta(lib, b["id"])
         title = meta.get("title") or os.path.splitext(b["name"])[0]
         data.append({
             "id": b["id"],
@@ -765,13 +796,12 @@ def _tool_find_books(args, context):
     books = scan_books()
     lib = load_library()
     trash = lib.get("trash", {})
-    meta_lib = lib.get("books", {})
     data = []
     for b in books:
         # 排除回收站中的书籍
         if b["id"] in trash:
             continue
-        meta = meta_lib.get(b["id"], {})
+        meta = get_book_meta(lib, b["id"])
         title = meta.get("title") or os.path.splitext(b["name"])[0]
         author = meta.get("author", "")
         if q in title.lower() or q in author.lower() or q in b["id"].lower():
@@ -791,10 +821,39 @@ def _tool_get_book_content(args, context):
         return make_tool_result(False, error="找不到这本书: {}".format(bid), retryable=False)
     ext = os.path.splitext(full)[1].lower()
     fmt = SUPPORTED_EXT.get(ext, "")
-    text = extract_book_text(full, fmt)
-    if not text:
-        return make_tool_result(False, error="无法提取 {} 格式书籍的文本内容: {}".format(fmt, bid), retryable=False)
-    return make_tool_result(True, data={"content": text, "format": fmt, "bookId": bid})
+    r = read_book_text(bid, full, fmt,
+                       offset=args.get("offset") or 0,
+                       limit=args.get("limit"),
+                       page=args.get("page"))
+    if not r.get("ok"):
+        if r.get("status") == "need_client":
+            # PDF 还没抽过文字。注意这不是"格式不支持", 而是"还没抽" ——
+            # 必须 retryable=True, 否则连续两次失败会让 Agent 提前停机,
+            # 用户看到的是"AI 突然不理人了", 完全归因不到 PDF 上。
+            return make_tool_result(True, data={
+                "content": "",
+                "format": fmt,
+                "bookId": bid,
+                "status": "need_client_extract",
+                "message": ("这本书是 PDF, 后端还没提取过它的文字(本机没装 PyMuPDF), "
+                            "所以现在读不到内容。已通过下面的指令通知前端用 pdf.js 开始提取, "
+                            "这通常要几秒到一分钟。请如实告诉用户: 文字正在提取中, "
+                            "等一会儿再问一次。不要立刻重试, 重试也还是空的。"
+                            "__ACTION__:extract_text:{}".format(bid)),
+            })
+        return make_tool_result(False, error="无法提取 {} 格式书籍的文本内容: {}".format(fmt or ext, bid), retryable=False)
+    return make_tool_result(True, data={
+        "content": r["content"],
+        "format": fmt,
+        "bookId": bid,
+        "totalChars": r["totalChars"],
+        "offset": r["offset"],
+        "length": r["length"],
+        "hasMore": r["hasMore"],
+        "nextOffset": r["nextOffset"],
+        "source": r["source"],
+        "pageCount": r.get("pageCount"),
+    })
 
 
 def _tool_get_book_metadata(args, context):
@@ -931,7 +990,7 @@ def _tool_delete_book(args, context):
     if not full:
         return make_tool_result(False, error="找不到这本书: {}".format(bid), retryable=False)
     lib = load_library()
-    meta = lib.get("books", {}).get(bid, {})
+    meta = get_book_meta(lib, bid)
     title = meta.get("title", bid)
     # 软删除: 移入回收站, 不删除文件
     trash = lib.setdefault("trash", {})
@@ -1107,10 +1166,18 @@ TOOL_DEFS = [
     },
     {
         "name": "get_book_content",
-        "description": "获取一本书的文本内容, 用于总结或分析",
+        "description": "获取一本书的文本内容, 用于总结或分析。长书会分段返回: "
+                       "返回 hasMore=true 时, 用 nextOffset 作为下一次的 offset 继续读; "
+                       "也可以用 page 直接跳到第 N 页。PDF 首次读取可能需要前端先提取文字, "
+                       "此时 status=need_client_extract, 用相同参数再调一次即可。",
         "parameters": {
             "type": "object",
-            "properties": {"book_id": {"type": "string", "description": "书籍ID (文件名)"}},
+            "properties": {
+                "book_id": {"type": "string", "description": "书籍ID (文件名)"},
+                "offset": {"type": "integer", "description": "起始字符偏移, 默认 0"},
+                "limit": {"type": "integer", "description": "本次取多少字符, 默认 24000, 上限 200000"},
+                "page": {"type": "integer", "description": "跳到第 N 页 (1 基), 优先于 offset"},
+            },
             "required": ["book_id"],
         },
         "handler": _tool_get_book_content,
@@ -1306,6 +1373,27 @@ TOOL_DEFS = [
     },
 ]
 
+
+def _render_tool_list():
+    """把 TOOL_DEFS 渲染成系统提示词里的能力清单。
+
+    这份清单以前是在提示词里手写的编号列表 —— 加到第 19 个工具时它还停在 17,
+    已经和实际工具对不上了。改成从 TOOL_DEFS 生成, 以后加工具不用再记得同步这里。
+    只取 description 的第一句, 免得把提示词撑得太长。
+    """
+    lines = []
+    for i, d in enumerate(TOOL_DEFS, 1):
+        desc = (d.get("description") or "").strip()
+        first = re.split(r'[。;；]', desc)[0].strip()
+        lines.append("{}. {} - {}".format(i, d["name"], first))
+    return "\n".join(lines)
+
+
+# 提示词里的 {TOOL_LIST} 占位符在这里落地 —— AI_SYSTEM_PROMPT 定义在 TOOL_DEFS
+# 之前, 所以只能等 TOOL_DEFS 就绪之后再替换。
+AI_SYSTEM_PROMPT = AI_SYSTEM_PROMPT.replace("{TOOL_LIST}", _render_tool_list())
+
+
 # OpenAI function-calling 格式
 AI_TOOLS = [
     {
@@ -1335,12 +1423,16 @@ def register_default_tools(registry):
 
 
 def extract_actions(text):
-    """从文本中提取 __ACTION__:open_book:<id> 动作指令"""
+    """从文本中提取 __ACTION__:<type>:<arg> 动作指令。
+
+    以前只认 open_book。改成泛化匹配, 新增动作类型时只要在下面加一个分支。
+    """
+    known = {"open_book", "extract_text"}
     actions = []
-    for m in re.finditer(r'__ACTION__:open_book:([^\s"\'\\]+)', text or ""):
-        book_id = m.group(1).strip()
-        if book_id:
-            actions.append({"type": "open_book", "book_id": book_id})
+    for m in re.finditer(ACTION_PATTERN, text or ""):
+        kind, arg = m.group(1).strip(), m.group(2).strip()
+        if kind in known and arg:
+            actions.append({"type": kind, "book_id": arg})
     return actions
 
 
@@ -1349,12 +1441,14 @@ def call_llm_api(config, messages, tools=None):
     """调用 OpenAI 兼容 API (非流式), 用于工具调用轮次。带重试。"""
     endpoint = config.get("endpoint", "").rstrip("/")
     if not endpoint:
-        endpoint = "https://api.openai.com/v1"
+        endpoint = DEFAULT_AI_ENDPOINT
     url = "{}/chat/completions".format(endpoint)
     api_key = config.get("api_key", "")
-    model = config.get("model", "gpt-4o-mini")
+    # 用 or 而不是 get(key, default): 配置里存在但为空串时也应退回默认模型
+    model = config.get("model") or DEFAULT_AI_MODEL
 
-    body = {"model": model, "messages": messages, "max_tokens": 8192}
+    body = {"model": model, "messages": messages,
+            "max_tokens": _cfg_int(config, "max_tokens", 8192)}
     if tools:
         body["tools"] = tools
 
@@ -1399,12 +1493,13 @@ def call_llm_stream(config, messages, tools=None):
     """调用 OpenAI 兼容 API (流式, 返回生成器)"""
     endpoint = config.get("endpoint", "").rstrip("/")
     if not endpoint:
-        endpoint = "https://api.openai.com/v1"
+        endpoint = DEFAULT_AI_ENDPOINT
     url = "{}/chat/completions".format(endpoint)
     api_key = config.get("api_key", "")
-    model = config.get("model", "gpt-4o-mini")
+    model = config.get("model") or DEFAULT_AI_MODEL
 
-    body = {"model": model, "messages": messages, "stream": True, "max_tokens": 8192}
+    body = {"model": model, "messages": messages, "stream": True,
+            "max_tokens": _cfg_int(config, "max_tokens", 8192)}
     if tools:
         body["tools"] = tools
 

@@ -1,6 +1,7 @@
 // reader.js — 阅读器：按格式分发 (PDF / EPUB / TXT / CBZ)，统一翻页/缩放/进度控制
 import API from './api.js';
 import Notes from './notes.js';
+import { extractPdfText } from './pdftext.js';
 
 const UNSUPPORTED = new Set(['mobi', 'azw3', 'docx', 'fb2', 'cbr']);
 
@@ -382,6 +383,20 @@ class PDFReader {
     this.total = this.pdf.numPages;
     if (this.resume?.page) this.page = Math.min(this.resume.page, this.total);
     await this.fit();
+    this._warmTextCache();
+  }
+  // 后台预热文字缓存。后端读不出 PDF 的文字(本机没装 PyMuPDF), 得靠这边的
+  // pdf.js 抽一次; 等用户问 AI"这本书讲什么"时才现抽就太晚了 —— 那时 AI 已经
+  // 拿到空结果了。所以打开就抽, 抽完落缓存, 之后随时可查。
+  async _warmTextCache() {
+    try {
+      const st = await API.getBookTextStatus(this.book.id);
+      if (st.cached) return;            // 已经有缓存, 不必重抽
+    } catch { return; }
+    // 延后一点, 先让首页渲染完, 别跟阅读抢主线程
+    setTimeout(() => {
+      extractPdfText(this.book.id).catch(() => { /* 抽不动就算了, 不打扰阅读 */ });
+    }, 1500);
   }
   // ---- 卷轴模式: 连续渲染所有页面 ----
   async _enterScrollMode() {
